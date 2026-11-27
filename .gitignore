@@ -1,0 +1,23 @@
+# Env berisi kredensial; yang di-commit hanya .env.example
+.env
+.env.*
+!.env.example
+
+# Binary hasil go build
+/streadway/consumer/consumer
+/streadway/producer/producer
+/amqp091/consumer/consumer
+/amqp091/producer/producer
+*.exe
+*.test
+*.out
+
+# Coverage & profiling
+coverage.*
+*.prof
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
