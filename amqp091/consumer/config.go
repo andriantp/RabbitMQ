@@ -4,6 +4,7 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"time"
 )
 
 type config struct {
@@ -17,6 +18,11 @@ type config struct {
 	// Dead letter, diturunkan dari nama exchange/queue (tidak perlu env baru)
 	DLX string // <exchange>.dlx
 	DLQ string // <queue>.dlq
+
+	// Retry queue ber-TTL untuk error sementara
+	RetryQueue string        // <queue>.retry
+	RetryMax   int           // maksimal retry sebelum ke DLQ
+	RetryDelay time.Duration // TTL retry queue = jeda antar percobaan
 }
 
 func loadConfig() config {
@@ -27,9 +33,12 @@ func loadConfig() config {
 		Queue:        mustEnv("RABBITMQ_QUEUE"),
 		BindingKey:   mustEnv("RABBITMQ_BINDING_KEY"),
 		MaxRetries:   envInt("RABBITMQ_MAX_RETRIES", 5),
+		RetryMax:     envInt("RABBITMQ_RETRY_MAX", 3),
+		RetryDelay:   envDuration("RABBITMQ_RETRY_DELAY", 10*time.Second),
 	}
 	cfg.DLX = cfg.Exchange + ".dlx"
 	cfg.DLQ = cfg.Queue + ".dlq"
+	cfg.RetryQueue = cfg.Queue + ".retry"
 	return cfg
 }
 
@@ -44,6 +53,19 @@ func envInt(key string, def int) int {
 		log.Fatalf("env %s harus bilangan bulat >= 0, dapat %q", key, v)
 	}
 	return n
+}
+
+// envDuration membaca env durasi opsional (format Go, mis. "10s", "1m"); pakai def jika kosong.
+func envDuration(key string, def time.Duration) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		log.Fatalf("env %s harus durasi > 0 (mis. 10s), dapat %q", key, v)
+	}
+	return d
 }
 
 func mustEnv(key string) string {

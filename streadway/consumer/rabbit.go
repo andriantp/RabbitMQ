@@ -33,12 +33,21 @@ func run(ctx context.Context, cfg config, seen *dedup) (consumed bool, err error
 	connClosed := conn.NotifyClose(make(chan *amqp.Error, 1))
 	chClosed := ch.NotifyClose(make(chan *amqp.Error, 1))
 
-	// 2-6. Topology (termasuk DLX/DLQ) & QoS; wajib diulang tiap reconnect karena channel baru
+	// 2-6. Topology (DLX/DLQ, retry queue) & QoS; wajib diulang tiap reconnect karena channel baru
 	if err := setup(ch, cfg); err != nil {
 		return false, err
 	}
 
-	// 7. Mulai consume dengan manual ack (autoAck=false)
+	// 7. Publisher confirm: dipakai saat menyalin pesan ke retry queue, supaya
+	//    pesan asli baru di-ack setelah salinannya pasti diterima broker.
+	if err := ch.Confirm(false); err != nil {
+		return false, fmt.Errorf("confirm mode: %w", err)
+	}
+	r := &retrier{ch: ch, queue: cfg.RetryQueue, max: cfg.RetryMax, delay: cfg.RetryDelay}
+	// streadway: buffer 1 cukup karena hanya ada satu publish yang ditunggu sekaligus
+	r.confirms = ch.NotifyPublish(make(chan amqp.Confirmation, 1))
+
+	// 8. Mulai consume dengan manual ack (autoAck=false)
 	msgs, err := ch.Consume(
 		cfg.Queue,   // queue
 		consumerTag, // consumer tag
@@ -52,8 +61,8 @@ func run(ctx context.Context, cfg config, seen *dedup) (consumed bool, err error
 		return false, fmt.Errorf("consume: %w", err)
 	}
 
-	log.Printf("terhubung, menunggu pesan: exchange=%q type=%s queue=%q bindingKey=%q dlq=%q",
-		cfg.Exchange, cfg.ExchangeType, cfg.Queue, cfg.BindingKey, cfg.DLQ)
+	log.Printf("terhubung, menunggu pesan: exchange=%q type=%s queue=%q bindingKey=%q dlq=%q retry=%q (maks %d, jeda %s)",
+		cfg.Exchange, cfg.ExchangeType, cfg.Queue, cfg.BindingKey, cfg.DLQ, cfg.RetryQueue, cfg.RetryMax, cfg.RetryDelay)
 
 	for {
 		select {
@@ -62,7 +71,9 @@ func run(ctx context.Context, cfg config, seen *dedup) (consumed bool, err error
 				// msgs ditutup saat koneksi/channel putus, kadang sebelum NotifyClose terbaca
 				return true, errors.New("delivery channel ditutup")
 			}
-			handle(d, seen)
+			if err := handle(d, seen, r); err != nil {
+				return true, err
+			}
 
 		case e := <-connClosed:
 			return true, fmt.Errorf("koneksi tertutup: %v", e)
@@ -87,6 +98,8 @@ func run(ctx context.Context, cfg config, seen *dedup) (consumed bool, err error
 // Semua idempotent, jadi aman dipanggil ulang setiap reconnect.
 //
 //	producer ─▶ exchange ─[bindingKey]─▶ queue ──Nack(requeue=false)──▶ DLX ─[queue]─▶ DLQ
+//	                                      ▲  │
+//	                     TTL habis (""/queue)  └─gagal sementara (publish)─▶ retry queue
 func setup(ch *amqp.Channel, cfg config) error {
 	// 2. Declare exchange
 	err := ch.ExchangeDeclare(
@@ -106,6 +119,11 @@ func setup(ch *amqp.Channel, cfg config) error {
 	//    Harus ada SEBELUM pesan pertama di-Nack; kalau DLX tidak punya binding
 	//    ke queue mana pun, pesan mati tetap hilang.
 	if err := setupDeadLetter(ch, cfg); err != nil {
+		return err
+	}
+
+	// 3b. Retry queue ber-TTL untuk error sementara (lihat retry.go)
+	if err := setupRetry(ch, cfg); err != nil {
 		return err
 	}
 
@@ -184,6 +202,32 @@ func setupDeadLetter(ch *amqp.Channel, cfg config) error {
 	// DLQ <- DLX dengan key = nama queue asal (lihat x-dead-letter-routing-key)
 	if err := ch.QueueBind(cfg.DLQ, cfg.Queue, cfg.DLX, false, nil); err != nil {
 		return fmt.Errorf("dlq bind: %w", err)
+	}
+	return nil
+}
+
+// setupRetry mendeklarasikan retry queue: tanpa consumer, pesan kedaluwarsa
+// setelah RetryDelay lalu dead-letter langsung kembali ke queue utama.
+func setupRetry(ch *amqp.Channel, cfg config) error {
+	_, err := ch.QueueDeclare(
+		cfg.RetryQueue, // name
+		true,           // durable
+		false,          // autoDelete
+		false,          // exclusive
+		false,          // noWait
+		amqp.Table{
+			// Jeda sebelum dicoba lagi. TTL per queue (bukan per pesan): RabbitMQ hanya
+			// meng-expire pesan di kepala queue, jadi TTL per pesan yang berbeda-beda
+			// di satu queue bisa saling menahan.
+			"x-message-ttl": cfg.RetryDelay.Milliseconds(),
+			// Default exchange ("") + routing key = nama queue utama: kembali HANYA ke
+			// queue ini, tidak ke queue lain yang bind ke exchange utama.
+			"x-dead-letter-exchange":    "",
+			"x-dead-letter-routing-key": cfg.Queue,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("retry queue declare: %w (RABBITMQ_RETRY_DELAY berubah? hapus queue %q dulu)", err, cfg.RetryQueue)
 	}
 	return nil
 }

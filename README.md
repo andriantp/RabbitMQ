@@ -23,6 +23,7 @@ Keduanya memakai protokol AMQP 0-9-1, jadi bisa saling bicara: producer `streadw
 │   │   ├── config.go           # baca env
 │   │   ├── rabbit.go           # run(): satu sesi koneksi; setup(): exchange/queue/bind/QoS
 │   │   ├── handler.go          # switch routing key -> handler per versi, ack/nack
+│   │   ├── retry.go            # retry queue ber-TTL: salin pesan + header retry, tunggu confirm
 │   │   └── dedup.go            # ingat MessageId yang sudah diproses
 │   └── producer/
 │       ├── main.go             # flag + signal ctx + reconnect.Run(run)
@@ -51,7 +52,9 @@ source .env
 | `RABBITMQ_QUEUE` | consumer | `app-test` | Nama queue |
 | `RABBITMQ_BINDING_KEY` | consumer | `app.#` | Pattern untuk `QueueBind` |
 | `RABBITMQ_ROUTING_KEY` | producer | `app.v1.order.created` | Key konkret untuk publish. Hanya default untuk flag `-key`; boleh kosong jika `-key` diisi |
-| `RABBITMQ_MAX_RETRIES` | keduanya | `5` | Opsional, default `5` |
+| `RABBITMQ_MAX_RETRIES` | keduanya | `5` | Opsional, default `5`. Batas percobaan **reconnect** |
+| `RABBITMQ_RETRY_MAX` | consumer | `3` | Opsional, default `3`. Batas **retry pesan** yang gagal sementara sebelum ke DLQ |
+| `RABBITMQ_RETRY_DELAY` | consumer | `10s` | Opsional, default `10s`. Jeda antar retry (TTL retry queue), format durasi Go |
 
 ## Menjalankan
 
@@ -67,6 +70,14 @@ go run ./producer -key app.v2.order.created -body '{"id":2}'   # masuk case v2
 go run ./producer -key app.v1.payment.paid                     # cocok dengan app.#, tapi tidak ada case -> Nack -> DLQ
 go run ./producer -key other.v1.x                              # tidak cocok binding mana pun -> 312 NO_ROUTE, dibuang
 go run ./producer -interval 500ms                              # lebih cepat
+```
+
+Mencoba retry dan DLQ (field `simulate` di body dibaca handler, lihat `simulate()` di [`handler.go`](amqp091/consumer/handler.go)):
+
+```bash
+go run ./producer -body '{"id":1,"simulate":"flaky"}'       # gagal sementara 2x, sukses di retry ke-2
+go run ./producer -body '{"id":1,"simulate":"transient"}'   # retry 3x lalu ke DLQ
+go run ./producer -body '{"id":1,"simulate":"permanent"}'   # langsung ke DLQ, tanpa retry
 ```
 
 Flag producer:
@@ -88,7 +99,8 @@ producer ──(app.v1.order.created)──▶ exchange "app" (topic)
                                    queue "app-test" ──▶ consumer ──▶ switch d.RoutingKey
                                         │                            ├─ app.v1.order.created -> handleOrderCreatedV1
                                         │                            ├─ app.v2.order.created -> handleOrderCreatedV2
-                                        │                            └─ default / error      -> Nack(requeue=false)
+                                        │                            ├─ error sementara      -> retry queue (lihat Retry)
+                                        │                            └─ default / error lain -> Nack(requeue=false)
                                         │ dead letter                                                  │
                                         ▼                                                              │
                          DLX "app.dlx" (direct) ◀──────────────────────────────────────────────────────┘
@@ -111,7 +123,8 @@ producer ──(app.v1.order.created)──▶ exchange "app" (topic)
 - **Auto-reconnect**: `NotifyClose` pada connection dan channel memicu reconnect dari nol (dial, channel, declare, bind, QoS, consume). Topology wajib dibuat ulang karena channel-nya baru.
 - **Exponential backoff** 1s → 2s → 4s … maksimal 30s, **maksimal `RABBITMQ_MAX_RETRIES` percobaan gagal berturut-turut**, lalu `exit 1` supaya systemd, Docker, atau Kubernetes yang me-restart. Hitungan di-reset hanya jika sesi berhasil consume **dan bertahan minimal 10s** (`reconnect.StableAfter`); sesi yang langsung putus lagi tetap dihitung gagal, jadi error yang selalu terulang berakhir dengan `exit 1`, bukan reconnect selamanya.
 - **Dedup `MessageId`**: pesan dengan `MessageId` yang sudah diproses akan di-Ack lalu dilewati. ID ditandai setelah handler sukses dan sebelum Ack.
-- **Dead letter (DLX + DLQ)**: pesan yang di-Nack tanpa requeue (routing key tidak dikenal, handler gagal) disimpan di DLQ, bukan dibuang.
+- **Retry queue ber-TTL**: error sementara dicoba lagi setelah `RABBITMQ_RETRY_DELAY`, maksimal `RABBITMQ_RETRY_MAX` kali, baru ke DLQ.
+- **Dead letter (DLX + DLQ)**: pesan yang di-Nack tanpa requeue (routing key tidak dikenal, error permanen, retry habis) disimpan di DLQ, bukan dibuang.
 - **Graceful shutdown**: Ctrl+C membatalkan consumer di broker, dan pesan yang belum di-ack dikembalikan ke queue.
 
 ### Producer
@@ -159,7 +172,8 @@ Queue utama dibuat dengan dua argumen:
 | Kejadian | Masuk DLQ? |
 |---|---|
 | Routing key tidak punya `case` | Ya |
-| Handler return error | Ya |
+| Handler return error permanen | Ya, langsung |
+| Handler return error sementara (`errTransient`) | Ya, setelah `RABBITMQ_RETRY_MAX` kali retry |
 | Duplikat `MessageId` (di-Ack) | Tidak |
 | `Nack(requeue=true)` | Tidak, kembali ke queue utama |
 | Unroutable dari producer (`312 NO_ROUTE`) | Tidak, pesan tidak pernah masuk queue. Untuk ini pakai *alternate exchange* |
@@ -174,7 +188,35 @@ Atau lewat management UI: **Queues → app-test.dlq → Get messages**. Untuk me
 
 > **Upgrade dari versi tanpa DLX:** argumen queue tidak bisa diubah, jadi queue `app-test` yang sudah ada akan ditolak dengan `PRECONDITION_FAILED - inequivalent arg 'x-dead-letter-exchange'`. Hapus queue lama sekali di management UI (pastikan kosong), lalu jalankan consumer lagi.
 
-Error sementara (DB down, dsb.) saat ini juga langsung masuk DLQ. Untuk retry otomatis dengan jeda, langkah berikutnya adalah retry queue ber-TTL atau quorum queue dengan `x-delivery-limit`.
+## Retry queue ber-TTL
+
+Untuk error sementara (DB down, timeout) yang mungkin pulih sendiri. `Nack(requeue=true)` tidak dipakai karena pesan langsung kembali ke depan queue dan gagal lagi tanpa jeda.
+
+```
+                 ┌─────────── TTL habis (RABBITMQ_RETRY_DELAY) ───────────┐
+                 ▼              dead letter via default exchange ""       │
+queue "app-test" ──▶ consumer ── gagal sementara ──▶ queue "app-test.retry"
+                        │          (publish + confirm, lalu Ack)   tanpa consumer
+                        └─ retry habis / error permanen ──▶ Nack ──▶ DLX ──▶ DLQ
+```
+
+1. Handler mengembalikan error yang dibungkus `errTransient` (`fmt.Errorf("%w: ...", errTransient)`). Error lain dianggap permanen.
+2. Consumer **menyalin** pesan ke `app-test.retry` lewat default exchange, menunggu publisher confirm, **lalu** Ack pesan asli. Urutan ini penting: kalau Ack duluan lalu koneksi putus, pesan hilang. Kalau Ack gagal setelah salinan terkirim, duplikatnya ditangani dedup `MessageId`, yang ikut disalin.
+3. `app-test.retry` tidak punya consumer. Setelah `x-message-ttl` habis, pesan dead-letter ke default exchange dengan routing key `app-test`, yaitu **langsung kembali ke queue ini saja**, tidak ke queue lain yang bind ke exchange `app`.
+4. Dua header dibawa di setiap salinan:
+
+| Header | Isi | Kenapa perlu |
+|---|---|---|
+| `x-retry-count` | 1, 2, 3, … | Hitungan retry. Header `x-death` dari broker tidak dipakai karena di-reset setiap pesan disalin ulang oleh client |
+| `x-original-routing-key` | `app.v1.order.created` | Pesan kembali lewat default exchange, jadi `d.RoutingKey` berubah menjadi `app-test`. Handler memakai header ini untuk `switch` |
+
+5. Setelah `RABBITMQ_RETRY_MAX` kali, pesan di-Nack ke DLQ dengan header di atas tetap terbawa, jadi di DLQ terlihat berapa kali sudah dicoba.
+
+Error sementara di retry ke-2 yang lalu sukses di retry ke-3 akan di-Ack normal dan tidak pernah sampai ke DLQ.
+
+Kalau publish ke retry queue gagal (timeout, NACK, channel putus), `handle()` mengembalikan error dan consumer reconnect. Pesan asli yang belum di-ack dikembalikan broker ke queue.
+
+Di streadway hal ini wajib, karena confirm yang terlambat bisa tertinggal di channel `NotifyPublish` lalu terbaca oleh publish berikutnya. Di amqp091 confirm per pesan (`DeferredConfirmation`), jadi masalah itu tidak ada.
 
 ## Perbedaan kode: streadway vs amqp091
 
@@ -195,6 +237,9 @@ Untuk migrasi, cukup ganti import dengan alias `amqp`, lalu pindahkan `Publish` 
 ## Batasan
 
 - **Dedup in-memory**: hilang saat consumer restart dan tidak dibagi antar instance. Kalau ada beberapa consumer di queue yang sama, pesan asli dan duplikatnya bisa jatuh ke consumer berbeda. Untuk produksi, pakai penyimpanan bersama, misalnya Redis `SET <id> 1 NX EX 600` atau unique constraint di database.
-- **Belum ada retry otomatis**: pesan yang gagal langsung ke DLQ, dan memutar ulang dari DLQ masih manual.
+- **Jeda retry tetap**: satu retry queue berarti satu TTL untuk semua percobaan, belum exponential. Untuk backoff bertingkat, pakai beberapa retry queue (`retry.5s`, `retry.30s`, …) dan pilih berdasarkan `x-retry-count`.
+- **Mengubah `RABBITMQ_RETRY_DELAY`** setelah retry queue dibuat akan error `PRECONDITION_FAILED` karena `x-message-ttl` adalah argumen queue. Hapus `<queue>.retry` dulu.
+- **Urutan tidak dijaga**: pesan yang di-retry diproses setelah pesan yang datang belakangan.
+- **Memutar ulang dari DLQ masih manual.**
 - **DLQ tidak dibatasi**: tanpa `x-max-length` atau `x-message-ttl`, DLQ bisa terus tumbuh kalau tidak dipantau.
 - Mengubah tipe exchange yang sudah ada, misalnya `direct` ke `topic` dengan nama yang sama, akan error `PRECONDITION_FAILED`. Pakai nama baru, atau hapus exchange lama di management UI.
