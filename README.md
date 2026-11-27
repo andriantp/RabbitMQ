@@ -64,7 +64,7 @@ cd streadway        # atau: cd amqp091
 go run ./consumer                                              # terminal 1
 go run ./producer                                              # terminal 2: kirim app.v1.order.created tiap 2s
 go run ./producer -key app.v2.order.created -body '{"id":2}'   # masuk case v2
-go run ./producer -key app.v1.payment.paid                     # cocok dengan app.#, tapi tidak ada case -> Nack di default
+go run ./producer -key app.v1.payment.paid                     # cocok dengan app.#, tapi tidak ada case -> Nack -> DLQ
 go run ./producer -key other.v1.x                              # tidak cocok binding mana pun -> 312 NO_ROUTE, dibuang
 go run ./producer -interval 500ms                              # lebih cepat
 ```
@@ -86,15 +86,21 @@ producer ──(app.v1.order.created)──▶ exchange "app" (topic)
                                         │ binding: app.#
                                         ▼
                                    queue "app-test" ──▶ consumer ──▶ switch d.RoutingKey
-                                                                     ├─ app.v1.order.created -> handleOrderCreatedV1
-                                                                     ├─ app.v2.order.created -> handleOrderCreatedV2
-                                                                     └─ default              -> Nack (dibuang)
+                                        │                            ├─ app.v1.order.created -> handleOrderCreatedV1
+                                        │                            ├─ app.v2.order.created -> handleOrderCreatedV2
+                                        │                            └─ default / error      -> Nack(requeue=false)
+                                        │ dead letter                                                  │
+                                        ▼                                                              │
+                         DLX "app.dlx" (direct) ◀──────────────────────────────────────────────────────┘
+                                        │ binding: app-test
+                                        ▼
+                         DLQ "app-test.dlq"   (disimpan, tidak di-consume)
 ```
 
 - Di topic exchange, pemisah segmen adalah **titik**. `app/v1/x` dianggap satu kata, sehingga wildcard tidak bisa memecahnya.
 - `*` cocok dengan tepat satu segmen, sedangkan `#` cocok dengan nol atau lebih segmen. `app.#` menerima semua event `app`.
 - Consumer bind dengan **pattern** (`RABBITMQ_BINDING_KEY`), sedangkan producer publish dengan **key konkret** (`RABBITMQ_ROUTING_KEY`). Switch di [`handler.go`](amqp091/consumer/handler.go) membaca `d.RoutingKey`, yaitu key asli dari producer.
-- Untuk menambah event atau versi baru, tambahkan `case` di `handler.go`. Event yang tidak punya `case` akan di-Nack tanpa requeue, artinya hilang dari queue ini.
+- Untuk menambah event atau versi baru, tambahkan `case` di `handler.go`. Event yang tidak punya `case` akan di-Nack tanpa requeue dan masuk DLQ (lihat [Dead letter](#dead-letter-dlx--dlq)).
 - `amq.topic` yang terlihat di UI adalah **nama** exchange bawaan, bukan tipe. Prefix `amq.` dicadangkan oleh RabbitMQ.
 
 ## Fitur
@@ -105,6 +111,7 @@ producer ──(app.v1.order.created)──▶ exchange "app" (topic)
 - **Auto-reconnect**: `NotifyClose` pada connection dan channel memicu reconnect dari nol (dial, channel, declare, bind, QoS, consume). Topology wajib dibuat ulang karena channel-nya baru.
 - **Exponential backoff** 1s → 2s → 4s … maksimal 30s, **maksimal `RABBITMQ_MAX_RETRIES` percobaan gagal berturut-turut**, lalu `exit 1` supaya systemd, Docker, atau Kubernetes yang me-restart. Hitungan di-reset hanya jika sesi berhasil consume **dan bertahan minimal 10s** (`reconnect.StableAfter`); sesi yang langsung putus lagi tetap dihitung gagal, jadi error yang selalu terulang berakhir dengan `exit 1`, bukan reconnect selamanya.
 - **Dedup `MessageId`**: pesan dengan `MessageId` yang sudah diproses akan di-Ack lalu dilewati. ID ditandai setelah handler sukses dan sebelum Ack.
+- **Dead letter (DLX + DLQ)**: pesan yang di-Nack tanpa requeue (routing key tidak dikenal, handler gagal) disimpan di DLQ, bukan dibuang.
 - **Graceful shutdown**: Ctrl+C membatalkan consumer di broker, dan pesan yang belum di-ack dikembalikan ke queue.
 
 ### Producer
@@ -135,6 +142,40 @@ Perilaku ini sudah diuji dengan proxy yang memutus koneksi tepat saat frame `bas
 
 `Redelivered=true` hanya menandai pengiriman ulang **dari broker ke consumer** (ack gagal). Duplikat yang berasal dari producer tetap tiba dengan `Redelivered=false`.
 
+## Dead letter (DLX + DLQ)
+
+Consumer mendeklarasikan sendiri di [`setup()`](amqp091/consumer/rabbit.go), tanpa env baru:
+
+| | Nama | Keterangan |
+|---|---|---|
+| DLX | `<RABBITMQ_EXCHANGE>.dlx` (`app.dlx`) | Exchange `direct`, hanya meneruskan, tidak menyimpan |
+| DLQ | `<RABBITMQ_QUEUE>.dlq` (`app-test.dlq`) | Queue durable, tempat pesan mati menumpuk |
+
+Queue utama dibuat dengan dua argumen:
+
+- `x-dead-letter-exchange = app.dlx`: ke mana pesan mati dikirim.
+- `x-dead-letter-routing-key = app-test`: routing key diganti nama queue, supaya satu DLX bisa dipakai banyak queue dan masing-masing masuk ke DLQ-nya sendiri. Key asli dari producer (`app.v1.payment.paid`) tetap tersimpan di header `x-death`, bersama `reason`, `queue`, dan `count`.
+
+| Kejadian | Masuk DLQ? |
+|---|---|
+| Routing key tidak punya `case` | Ya |
+| Handler return error | Ya |
+| Duplikat `MessageId` (di-Ack) | Tidak |
+| `Nack(requeue=true)` | Tidak, kembali ke queue utama |
+| Unroutable dari producer (`312 NO_ROUTE`) | Tidak, pesan tidak pernah masuk queue. Untuk ini pakai *alternate exchange* |
+
+Melihat isi DLQ tanpa menghapusnya:
+
+```bash
+rabbitmqadmin -u guest -p guest get queue=app-test.dlq count=10 ackmode=ack_requeue_true
+```
+
+Atau lewat management UI: **Queues → app-test.dlq → Get messages**. Untuk memutar ulang, pindahkan pesan ke exchange `app` dengan routing key aslinya (UI: plugin *shovel*, atau ambil lalu publish ulang).
+
+> **Upgrade dari versi tanpa DLX:** argumen queue tidak bisa diubah, jadi queue `app-test` yang sudah ada akan ditolak dengan `PRECONDITION_FAILED - inequivalent arg 'x-dead-letter-exchange'`. Hapus queue lama sekali di management UI (pastikan kosong), lalu jalankan consumer lagi.
+
+Error sementara (DB down, dsb.) saat ini juga langsung masuk DLQ. Untuk retry otomatis dengan jeda, langkah berikutnya adalah retry queue ber-TTL atau quorum queue dengan `x-delivery-limit`.
+
 ## Perbedaan kode: streadway vs amqp091
 
 Exchange, queue, binding, QoS, ack/nack, `NotifyClose`, dan `NotifyReturn` memiliki API **yang sama persis**. Perbedaannya hanya ini:
@@ -154,5 +195,6 @@ Untuk migrasi, cukup ganti import dengan alias `amqp`, lalu pindahkan `Publish` 
 ## Batasan
 
 - **Dedup in-memory**: hilang saat consumer restart dan tidak dibagi antar instance. Kalau ada beberapa consumer di queue yang sama, pesan asli dan duplikatnya bisa jatuh ke consumer berbeda. Untuk produksi, pakai penyimpanan bersama, misalnya Redis `SET <id> 1 NX EX 600` atau unique constraint di database.
-- **Pesan yang di-Nack tanpa requeue akan dibuang.** Untuk menyimpannya, konfigurasikan dead letter exchange (DLX) di queue.
+- **Belum ada retry otomatis**: pesan yang gagal langsung ke DLQ, dan memutar ulang dari DLQ masih manual.
+- **DLQ tidak dibatasi**: tanpa `x-max-length` atau `x-message-ttl`, DLQ bisa terus tumbuh kalau tidak dipantau.
 - Mengubah tipe exchange yang sudah ada, misalnya `direct` ke `topic` dengan nama yang sama, akan error `PRECONDITION_FAILED`. Pakai nama baru, atau hapus exchange lama di management UI.

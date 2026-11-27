@@ -36,17 +36,19 @@ func handle(d amqp.Delivery, seen *dedup) {
 	case "app.v2.order.created":
 		err = handleOrderCreatedV2(d.Body)
 	default:
-		// Tidak ada handler: Nack tanpa requeue supaya tidak berputar terus
-		// (pesan dibuang, atau masuk DLX jika dikonfigurasi).
-		log.Printf("routing key tidak dikenal: %s", d.RoutingKey)
+		// Tidak ada handler (mis. producer sudah kirim versi baru, consumer belum
+		// di-deploy): Nack tanpa requeue -> DLX -> DLQ. Setelah handler ditambah,
+		// pesan bisa diputar ulang dari DLQ.
+		log.Printf("routing key tidak dikenal, ke DLQ: %s", d.RoutingKey)
 		_ = d.Nack(false, false)
 		return
 	}
 
 	if err != nil {
-		// Gagal diproses -> Nack tanpa requeue. Untuk error sementara
-		// (mis. DB down), pakai d.Nack(false, true) agar pesan dikirim ulang.
-		log.Printf("gagal proses: %v", err)
+		// Gagal diproses -> Nack tanpa requeue -> DLX -> DLQ untuk diperiksa.
+		// Jangan d.Nack(false, true) untuk error sementara (mis. DB down): pesan
+		// langsung kembali ke depan queue dan gagal lagi tanpa jeda.
+		log.Printf("gagal proses, ke DLQ: %v", err)
 		_ = d.Nack(false, false)
 		return
 	}

@@ -13,10 +13,14 @@ type config struct {
 	Queue        string
 	BindingKey   string
 	MaxRetries   int
+
+	// Dead letter, diturunkan dari nama exchange/queue (tidak perlu env baru)
+	DLX string // <exchange>.dlx
+	DLQ string // <queue>.dlq
 }
 
 func loadConfig() config {
-	return config{
+	cfg := config{
 		Host:         mustEnv("RABBITMQ_HOST"),
 		Exchange:     mustEnv("RABBITMQ_EXCHANGE"),
 		ExchangeType: mustEnv("RABBITMQ_EXCHANGE_TYPE"),
@@ -24,6 +28,9 @@ func loadConfig() config {
 		BindingKey:   mustEnv("RABBITMQ_BINDING_KEY"),
 		MaxRetries:   envInt("RABBITMQ_MAX_RETRIES", 5),
 	}
+	cfg.DLX = cfg.Exchange + ".dlx"
+	cfg.DLQ = cfg.Queue + ".dlq"
+	return cfg
 }
 
 // envInt membaca env integer opsional; pakai def jika kosong.
