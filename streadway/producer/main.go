@@ -13,16 +13,25 @@ import (
 )
 
 func main() {
-	cfg := loadConfig()
-
 	// Contoh:
 	//   go run ./producer                                     # kirim tiap 2s
 	//   go run ./producer -interval 500ms -key app.v2.order.created
 	//   go run ./producer -body '{"id":99}'                   # body tetap
-	key := flag.String("key", cfg.RoutingKey, "routing key (default: RABBITMQ_ROUTING_KEY)")
+	//
+	// Flag diparse SEBELUM loadConfig supaya -h jalan tanpa env, dan -key bisa
+	// menggantikan RABBITMQ_ROUTING_KEY (env hanya jadi nilai default).
+	key := flag.String("key", os.Getenv("RABBITMQ_ROUTING_KEY"), "routing key (default: $RABBITMQ_ROUTING_KEY)")
 	body := flag.String("body", "", "isi pesan tetap (default: JSON contoh dengan id berurutan)")
 	interval := flag.Duration("interval", 2*time.Second, "jeda antar publish")
 	flag.Parse()
+	if *key == "" {
+		log.Fatal("routing key kosong: set RABBITMQ_ROUTING_KEY atau pakai -key")
+	}
+	if *interval <= 0 {
+		log.Fatalf("-interval harus > 0, dapat %s", *interval)
+	}
+
+	cfg := loadConfig()
 
 	// Cancel saat Ctrl+C / SIGTERM
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

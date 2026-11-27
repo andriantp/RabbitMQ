@@ -50,7 +50,7 @@ source .env
 | `RABBITMQ_EXCHANGE_TYPE` | keduanya | `topic` | `direct` / `topic` / `fanout` / `headers`, tanpa prefix |
 | `RABBITMQ_QUEUE` | consumer | `app-test` | Nama queue |
 | `RABBITMQ_BINDING_KEY` | consumer | `app.#` | Pattern untuk `QueueBind` |
-| `RABBITMQ_ROUTING_KEY` | producer | `app.v1.order.created` | Key konkret untuk publish (default flag `-key`) |
+| `RABBITMQ_ROUTING_KEY` | producer | `app.v1.order.created` | Key konkret untuk publish. Hanya default untuk flag `-key`; boleh kosong jika `-key` diisi |
 | `RABBITMQ_MAX_RETRIES` | keduanya | `5` | Opsional, default `5` |
 
 ## Menjalankan
@@ -73,9 +73,9 @@ Flag producer:
 
 | Flag | Default | Keterangan |
 |---|---|---|
-| `-key` | `$RABBITMQ_ROUTING_KEY` | Routing key |
+| `-key` | `$RABBITMQ_ROUTING_KEY` | Routing key; wajib ada dari salah satunya |
 | `-body` | JSON contoh `{"id":N,"created_at":...}` | Isi pesan tetap |
-| `-interval` | `2s` | Jeda antar publish |
+| `-interval` | `2s` | Jeda antar publish, harus > 0 |
 
 Producer dan consumer sama-sama berjalan sampai Ctrl+C.
 

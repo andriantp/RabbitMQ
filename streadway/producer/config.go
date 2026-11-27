@@ -6,11 +6,12 @@ import (
 	"strconv"
 )
 
+// Routing key tidak ada di sini: dibaca dari flag -key (default env
+// RABBITMQ_ROUTING_KEY) di main.go.
 type config struct {
 	Host         string
 	Exchange     string
 	ExchangeType string
-	RoutingKey   string
 	MaxRetries   int
 }
 
@@ -19,7 +20,6 @@ func loadConfig() config {
 		Host:         mustEnv("RABBITMQ_HOST"),
 		Exchange:     mustEnv("RABBITMQ_EXCHANGE"),
 		ExchangeType: mustEnv("RABBITMQ_EXCHANGE_TYPE"),
-		RoutingKey:   mustEnv("RABBITMQ_ROUTING_KEY"),
 		MaxRetries:   envInt("RABBITMQ_MAX_RETRIES", 5),
 	}
 }
