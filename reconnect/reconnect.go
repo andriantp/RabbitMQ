@@ -16,37 +16,52 @@ import (
 const (
 	MinBackoff = 1 * time.Second
 	MaxBackoff = 30 * time.Second
+
+	// StableAfter: sesi sehat baru dianggap "pulih" (backoff & hitungan retry
+	// di-reset) jika bertahan minimal selama ini. Tanpa batas ini, sesi yang
+	// sempat sehat lalu langsung putus lagi (mis. channel ditutup broker karena
+	// error yang selalu terulang) akan reconnect selamanya dan tidak pernah exit.
+	StableAfter = 10 * time.Second
 )
 
 // Session menjalankan satu sesi koneksi sampai putus (return error) atau ctx
-// cancel. healthy=true jika sesi sempat sehat (mis. sudah consume / terhubung),
-// yang me-reset backoff dan hitungan retry.
+// cancel. healthy=true jika sesi sempat sehat (mis. sudah consume / terhubung).
 type Session func(ctx context.Context) (healthy bool, err error)
+
+type policy struct {
+	minBackoff, maxBackoff, stableAfter time.Duration
+}
 
 // Run memanggil session berulang kali dengan exponential backoff
 // (MinBackoff -> x2 -> ... -> MaxBackoff), maksimal maxRetries percobaan gagal
-// berturut-turut.
+// berturut-turut. Sesi dihitung gagal kecuali sehat DAN bertahan >= StableAfter.
 //
 // Return nil saat ctx cancel (shutdown normal), atau error saat menyerah;
 // pemanggil sebaiknya exit non-zero supaya supervisor (systemd/Docker/k8s)
 // yang me-restart.
 func Run(ctx context.Context, maxRetries int, session Session) error {
-	return run(ctx, maxRetries, MinBackoff, MaxBackoff, session)
+	return run(ctx, maxRetries, policy{MinBackoff, MaxBackoff, StableAfter}, session)
 }
 
-func run(ctx context.Context, maxRetries int, minBackoff, maxBackoff time.Duration, session Session) error {
-	backoff := minBackoff
+func run(ctx context.Context, maxRetries int, p policy, session Session) error {
+	backoff := p.minBackoff
 	retries := 0
 	for {
+		start := time.Now()
 		healthy, err := session(ctx)
 		if ctx.Err() != nil {
 			return nil
 		}
 
-		// Sesi sempat sehat -> reset backoff & hitungan retry
-		if healthy {
-			backoff = minBackoff
-			retries = 0
+		// Sesi sehat dan cukup lama -> koneksi dianggap pulih: reset backoff & retry
+		if lasted := time.Since(start); healthy {
+			if lasted >= p.stableAfter {
+				backoff = p.minBackoff
+				retries = 0
+			} else {
+				log.Printf("sesi hanya bertahan %s (< %s), tetap dihitung sebagai percobaan gagal",
+					lasted.Round(time.Millisecond), p.stableAfter)
+			}
 		}
 
 		if retries >= maxRetries {
@@ -60,6 +75,6 @@ func run(ctx context.Context, maxRetries int, minBackoff, maxBackoff time.Durati
 		case <-ctx.Done():
 			return nil
 		}
-		backoff = min(backoff*2, maxBackoff)
+		backoff = min(backoff*2, p.maxBackoff)
 	}
 }

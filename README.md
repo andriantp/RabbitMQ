@@ -103,7 +103,7 @@ producer ──(app.v1.order.created)──▶ exchange "app" (topic)
 
 - **Manual ack + QoS** `Qos(1, 0, false)`: maksimal 1 pesan belum di-ack per consumer. Beberapa consumer di queue yang sama akan berbagi pesan secara round-robin.
 - **Auto-reconnect**: `NotifyClose` pada connection dan channel memicu reconnect dari nol (dial, channel, declare, bind, QoS, consume). Topology wajib dibuat ulang karena channel-nya baru.
-- **Exponential backoff** 1s → 2s → 4s … maksimal 30s, **maksimal `RABBITMQ_MAX_RETRIES` percobaan gagal berturut-turut**, lalu `exit 1` supaya systemd, Docker, atau Kubernetes yang me-restart. Hitungan di-reset setiap kali berhasil consume lagi.
+- **Exponential backoff** 1s → 2s → 4s … maksimal 30s, **maksimal `RABBITMQ_MAX_RETRIES` percobaan gagal berturut-turut**, lalu `exit 1` supaya systemd, Docker, atau Kubernetes yang me-restart. Hitungan di-reset hanya jika sesi berhasil consume **dan bertahan minimal 10s** (`reconnect.StableAfter`); sesi yang langsung putus lagi tetap dihitung gagal, jadi error yang selalu terulang berakhir dengan `exit 1`, bukan reconnect selamanya.
 - **Dedup `MessageId`**: pesan dengan `MessageId` yang sudah diproses akan di-Ack lalu dilewati. ID ditandai setelah handler sukses dan sebelum Ack.
 - **Graceful shutdown**: Ctrl+C membatalkan consumer di broker, dan pesan yang belum di-ack dikembalikan ke queue.
 
