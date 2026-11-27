@@ -8,11 +8,8 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
-)
 
-const (
-	minBackoff = 1 * time.Second
-	maxBackoff = 30 * time.Second
+	"example.com/rabbitmq/reconnect"
 )
 
 func main() {
@@ -31,38 +28,16 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// state bertahan lintas reconnect (seq, pending, total terkirim)
 	st := &state{key: *key, body: *body, interval: *interval}
 
-	// Loop reconnect, sama seperti consumer: exponential backoff, maksimal
-	// cfg.MaxRetries percobaan gagal berturut-turut, lalu exit(1).
-	backoff := minBackoff
-	retries := 0
-	for {
-		connected, err := run(ctx, cfg, st)
-		if ctx.Err() != nil {
-			log.Printf("shutdown selesai (total terkirim: %d)", st.sent)
-			return
-		}
-
-		// Sempat terhubung = koneksi sebelumnya sehat -> reset backoff & hitungan retry
-		if connected {
-			backoff = minBackoff
-			retries = 0
-		}
-
-		if retries >= cfg.MaxRetries {
-			log.Printf("terputus: %v; menyerah setelah %d percobaan reconnect", err, retries)
-			os.Exit(1)
-		}
-		retries++
-		log.Printf("terputus: %v; reconnect %d/%d dalam %s", err, retries, cfg.MaxRetries, backoff)
-
-		select {
-		case <-time.After(backoff):
-		case <-ctx.Done():
-			log.Printf("shutdown selesai (total terkirim: %d)", st.sent)
-			return
-		}
-		backoff = min(backoff*2, maxBackoff)
+	// Loop reconnect, sama seperti consumer. Sempat terhubung = sesi sehat.
+	err := reconnect.Run(ctx, cfg.MaxRetries, func(ctx context.Context) (bool, error) {
+		return run(ctx, cfg, st)
+	})
+	if err != nil {
+		log.Print(err)
+		os.Exit(1)
 	}
+	log.Printf("shutdown selesai (total terkirim: %d)", st.sent)
 }

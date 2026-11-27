@@ -14,15 +14,18 @@ Keduanya memakai protokol AMQP 0-9-1, jadi bisa saling bicara: producer `streadw
 ```
 .
 ├── .env.example
-├── streadway/                  # modul Go sendiri (go.mod)
+├── reconnect/                  # modul bersama: loop reconnect (backoff, max retries)
+│   ├── reconnect.go            # reconnect.Run(ctx, maxRetries, session)
+│   └── reconnect_test.go
+├── streadway/                  # modul Go sendiri (go.mod, replace -> ../reconnect)
 │   ├── consumer/
-│   │   ├── main.go             # signal ctx + loop reconnect (backoff, max retries)
+│   │   ├── main.go             # signal ctx + reconnect.Run(run)
 │   │   ├── config.go           # baca env
 │   │   ├── rabbit.go           # run(): satu sesi koneksi; setup(): exchange/queue/bind/QoS
 │   │   ├── handler.go          # switch routing key -> handler per versi, ack/nack
 │   │   └── dedup.go            # ingat MessageId yang sudah diproses
 │   └── producer/
-│       ├── main.go             # flag + signal ctx + loop reconnect
+│       ├── main.go             # flag + signal ctx + reconnect.Run(run)
 │       ├── config.go           # baca env
 │       ├── producer.go         # publish periodik, pending, MessageId
 │       └── rabbit.go           # publisher: connect, confirm, publish, tunggu confirm
@@ -30,6 +33,8 @@ Keduanya memakai protokol AMQP 0-9-1, jadi bisa saling bicara: producer `streadw
 ```
 
 Satu folder adalah satu `package main` yang terdiri dari beberapa file. Jalankan dengan `go run ./consumer`, bukan `go run ./consumer/main.go`.
+
+Loop reconnect tidak bergantung pada library AMQP, jadi keempat `main.go` memakai satu implementasi di [`reconnect/`](reconnect/). Modul `streadway` dan `amqp091` menunjuk ke sana lewat `replace example.com/rabbitmq/reconnect => ../reconnect` di `go.mod`. Test-nya: `cd reconnect && go test ./...`.
 
 ## Konfigurasi
 
@@ -150,5 +155,4 @@ Untuk migrasi, cukup ganti import dengan alias `amqp`, lalu pindahkan `Publish` 
 
 - **Dedup in-memory**: hilang saat consumer restart dan tidak dibagi antar instance. Kalau ada beberapa consumer di queue yang sama, pesan asli dan duplikatnya bisa jatuh ke consumer berbeda. Untuk produksi, pakai penyimpanan bersama, misalnya Redis `SET <id> 1 NX EX 600` atau unique constraint di database.
 - **Pesan yang di-Nack tanpa requeue akan dibuang.** Untuk menyimpannya, konfigurasikan dead letter exchange (DLX) di queue.
-- **Kode reconnect diduplikasi** di 4 `main.go`. Kalau mengganggu, bisa dipindah ke package bersama.
 - Mengubah tipe exchange yang sudah ada, misalnya `direct` ke `topic` dengan nama yang sama, akan error `PRECONDITION_FAILED`. Pakai nama baru, atau hapus exchange lama di management UI.
